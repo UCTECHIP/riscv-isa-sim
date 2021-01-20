@@ -405,11 +405,13 @@ reg_t processor_t::vectorUnit_t::set_vl(int rd, int rs1, reg_t reqVL, reg_t newT
   if (vlmax == 0) {
     vl = 0;
   } else if (rd == 0 && rs1 == 0) {
-    vl = vl > vlmax ? vlmax : vl;
+    vl = vl > 2*vlmax ? vlmax :
+         vl > vlmax ? (vl/2 + vl%2) : vl;
   } else if (rd != 0 && rs1 == 0) {
     vl = vlmax;
   } else if (rs1 != 0) {
-    vl = reqVL > vlmax ? vlmax : reqVL;
+    vl = reqVL > 2*vlmax ? vlmax :
+         reqVL > vlmax ? (reqVL/2 + reqVL%2) : reqVL;
   }
 
   vstart = 0;
