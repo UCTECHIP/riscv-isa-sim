@@ -67,6 +67,7 @@ const int NCSR = 4096;
   (((x) & 0x03) < 0x03 ? 2 : \
    ((x) & 0x1f) < 0x1f ? 4 : \
    ((x) & 0x3f) < 0x3f ? 6 : \
+   ((x) & 0x7f) == 0x7f ? 4 : \
    8)
 #define MAX_INSN_LENGTH 8
 #define PC_ALIGN 2
@@ -91,6 +92,9 @@ public:
   uint64_t rs3() { return x(27, 5); }
   uint64_t rm() { return x(12, 3); }
   uint64_t csr() { return x(20, 12); }
+  uint64_t iorw() { return x(20, 8); }
+  uint64_t bs  () {return x(30,2);} // Crypto ISE - SM4/AES32 byte select.
+  uint64_t rcon() {return x(20,4);} // Crypto ISE - AES64 round const.
 
   int64_t rvc_imm() { return x(2, 5) + (xs(12, 1) << 5); }
   int64_t rvc_zimm() { return x(2, 5) + (x(12, 1) << 5); }
@@ -116,6 +120,7 @@ public:
   uint64_t v_nf() { return x(29, 3); }
   uint64_t v_simm5() { return xs(15, 5); }
   uint64_t v_zimm5() { return x(15, 5); }
+  uint64_t v_zimm10() { return x(20, 10); }
   uint64_t v_zimm11() { return x(20, 11); }
   uint64_t v_lmul() { return x(20, 2); }
   uint64_t v_frac_lmul() { return x(22, 1); }
@@ -127,6 +132,12 @@ public:
   uint64_t v_vta() { return x(26, 1); }
   uint64_t v_vma() { return x(27, 1); }
   uint64_t v_mew() { return x(28, 1); }
+
+  uint64_t p_imm2() { return x(20, 2); }
+  uint64_t p_imm3() { return x(20, 3); }
+  uint64_t p_imm4() { return x(20, 4); }
+  uint64_t p_imm5() { return x(20, 5); }
+  uint64_t p_imm6() { return x(20, 6); }
 
 private:
   insn_bits_t b;
@@ -213,9 +224,13 @@ private:
 #define FRS1 READ_FREG(insn.rs1())
 #define FRS2 READ_FREG(insn.rs2())
 #define FRS3 READ_FREG(insn.rs3())
-#define dirty_fp_state (STATE.mstatus |= MSTATUS_FS | (xlen == 64 ? MSTATUS64_SD : MSTATUS32_SD))
-#define dirty_ext_state (STATE.mstatus |= MSTATUS_XS | (xlen == 64 ? MSTATUS64_SD : MSTATUS32_SD))
-#define dirty_vs_state (STATE.mstatus |= MSTATUS_VS | (xlen == 64 ? MSTATUS64_SD : MSTATUS32_SD))
+#define dirty_mstatus(bits) ({ reg_t dirties = (bits) | (xlen == 64 ? MSTATUS64_SD : MSTATUS32_SD); \
+                               STATE.mstatus |= dirties; \
+                               if (STATE.v) STATE.vsstatus |= dirties; \
+                            })
+#define dirty_fp_state  dirty_mstatus(MSTATUS_FS)
+#define dirty_ext_state dirty_mstatus(MSTATUS_XS)
+#define dirty_vs_state  dirty_mstatus(MSTATUS_VS)
 #define DO_WRITE_FREG(reg, value) (STATE.FPR.write(reg, value), dirty_fp_state)
 #define WRITE_FRD(value) WRITE_FREG(insn.rd(), value)
  
@@ -236,10 +251,11 @@ private:
 #define require_rv64 require(xlen == 64)
 #define require_rv32 require(xlen == 32)
 #define require_extension(s) require(p->supports_extension(s))
-#define require_fp require((STATE.mstatus & MSTATUS_FS) != 0)
-#define require_accelerator require((STATE.mstatus & MSTATUS_XS) != 0)
-
-#define require_vector_vs require((STATE.mstatus & MSTATUS_VS) != 0);
+#define require_either_extension(A,B) require(p->supports_extension(A) || p->supports_extension(B));
+#define require_impl(s) require(p->supports_impl(s))
+#define require_fp require(((STATE.mstatus & MSTATUS_FS) != 0) && ((STATE.v == 0) || ((STATE.vsstatus & SSTATUS_FS) != 0)))
+#define require_accelerator require(((STATE.mstatus & MSTATUS_XS) != 0) && ((STATE.v == 0) || ((STATE.vsstatus & SSTATUS_XS) != 0)))
+#define require_vector_vs require(((STATE.mstatus & MSTATUS_VS) != 0) && ((STATE.v == 0) || ((STATE.vsstatus & SSTATUS_VS) != 0)))
 #define require_vector(alu) \
   do { \
     require_vector_vs; \
@@ -276,7 +292,8 @@ private:
 #define sext32(x) ((sreg_t)(int32_t)(x))
 #define zext32(x) ((reg_t)(uint32_t)(x))
 #define sext_xlen(x) (((sreg_t)(x) << (64-xlen)) >> (64-xlen))
-#define zext_xlen(x) (((reg_t)(x) << (64-xlen)) >> (64-xlen))
+#define zext(x, pos) (((reg_t)(x) << (64-(pos))) >> (64-(pos)))
+#define zext_xlen(x) zext(x, xlen)
 
 #define set_pc(x) \
   do { p->check_pc_alignment(x); \
@@ -487,19 +504,22 @@ static inline bool is_aligned(const unsigned val, const unsigned pos)
 
 #define VI_CHECK_LD_INDEX(elt_width) \
   VI_CHECK_ST_INDEX(elt_width); \
-  if (elt_width > P.VU.vsew) { \
-    if (insn.rd() != insn.rs2()) \
-      require_noover(insn.rd(), P.VU.vflmul, insn.rs2(), vemul); \
-  } else if (elt_width < P.VU.vsew) { \
-    if (vemul < 1) {\
-      require_noover(insn.rd(), P.VU.vflmul, insn.rs2(), vemul); \
-    } else {\
-      require_noover_widen(insn.rd(), P.VU.vflmul, insn.rs2(), vemul); \
+  for (reg_t idx = 0; idx < nf; ++idx) { \
+    reg_t flmul = P.VU.vflmul < 1 ? 1 : P.VU.vflmul; \
+    reg_t seg_vd = insn.rd() + flmul * idx;  \
+    if (elt_width > P.VU.vsew) { \
+      if (seg_vd != insn.rs2()) \
+        require_noover(seg_vd, P.VU.vflmul, insn.rs2(), vemul); \
+    } else if (elt_width < P.VU.vsew) { \
+      if (vemul < 1) {\
+        require_noover(seg_vd, P.VU.vflmul, insn.rs2(), vemul); \
+      } else {\
+        require_noover_widen(seg_vd, P.VU.vflmul, insn.rs2(), vemul); \
+      } \
     } \
-  } \
-  if (insn.v_nf() > 0) {\
-    require_noover(insn.rd(), P.VU.vflmul, insn.rs2(), vemul); \
-    require_noover(vd, nf, insn.rs2(), 1); \
+    if (nf >= 2) { \
+      require_noover(seg_vd, P.VU.vflmul, insn.rs2(), vemul); \
+    } \
   } \
   require_vm; \
 
@@ -523,18 +543,18 @@ static inline bool is_aligned(const unsigned val, const unsigned pos)
     } \
   }
 
-#define VI_CHECK_STORE(elt_width) \
+#define VI_CHECK_STORE(elt_width, is_mask_ldst) \
   require_vector(false); \
-  reg_t veew = sizeof(elt_width##_t) * 8; \
-  float vemul = ((float)veew / P.VU.vsew * P.VU.vflmul); \
+  reg_t veew = is_mask_ldst ? 1 : sizeof(elt_width##_t) * 8; \
+  float vemul = is_mask_ldst ? 1 : ((float)veew / P.VU.vsew * P.VU.vflmul); \
   reg_t emul = vemul < 1 ? 1 : vemul; \
   require(vemul >= 0.125 && vemul <= 8); \
   require_align(insn.rd(), vemul); \
   require((nf * emul) <= (NVPR / 4) && \
           (insn.rd() + nf * emul) <= NVPR); \
 
-#define VI_CHECK_LOAD(elt_width) \
-  VI_CHECK_STORE(elt_width); \
+#define VI_CHECK_LOAD(elt_width, is_mask_ldst) \
+  VI_CHECK_STORE(elt_width, is_mask_ldst); \
   require_vm; \
 
 #define VI_CHECK_DSS(is_vs1) \
@@ -1598,12 +1618,12 @@ for (reg_t i = 0; i < P.VU.vlmax && P.VU.vl != 0; ++i) { \
   } \
 }
 
-#define VI_LD(stride, offset, elt_width) \
+#define VI_LD(stride, offset, elt_width, is_mask_ldst) \
   const reg_t nf = insn.v_nf() + 1; \
-  const reg_t vl = P.VU.vl; \
+  const reg_t vl = is_mask_ldst ? ((P.VU.vl + 7) / 8) : P.VU.vl; \
   const reg_t baseAddr = RS1; \
   const reg_t vd = insn.rd(); \
-  VI_CHECK_LOAD(elt_width); \
+  VI_CHECK_LOAD(elt_width, is_mask_ldst); \
   for (reg_t i = 0; i < vl; ++i) { \
     VI_ELEMENT_SKIP(i); \
     VI_STRIP(i); \
@@ -1652,12 +1672,12 @@ for (reg_t i = 0; i < P.VU.vlmax && P.VU.vl != 0; ++i) { \
   } \
   P.VU.vstart = 0;
 
-#define VI_ST(stride, offset, elt_width) \
+#define VI_ST(stride, offset, elt_width, is_mask_ldst) \
   const reg_t nf = insn.v_nf() + 1; \
-  const reg_t vl = P.VU.vl; \
+  const reg_t vl = is_mask_ldst ? ((P.VU.vl + 7) / 8) : P.VU.vl; \
   const reg_t baseAddr = RS1; \
   const reg_t vs3 = insn.rd(); \
-  VI_CHECK_STORE(elt_width); \
+  VI_CHECK_STORE(elt_width, is_mask_ldst); \
   for (reg_t i = 0; i < vl; ++i) { \
     VI_STRIP(i) \
     VI_ELEMENT_SKIP(i); \
@@ -1712,7 +1732,7 @@ for (reg_t i = 0; i < P.VU.vlmax && P.VU.vl != 0; ++i) { \
   const reg_t vl = p->VU.vl; \
   const reg_t baseAddr = RS1; \
   const reg_t rd_num = insn.rd(); \
-  VI_CHECK_LOAD(elt_width); \
+  VI_CHECK_LOAD(elt_width, false); \
   bool early_stop = false; \
   for (reg_t i = p->VU.vstart; i < vl; ++i) { \
     VI_STRIP(i); \
@@ -1860,6 +1880,7 @@ for (reg_t i = 0; i < P.VU.vlmax && P.VU.vl != 0; ++i) { \
   require_vm; \
   reg_t from = P.VU.vsew / div; \
   require(from >= e8 && from <= e64); \
+  require(((float)P.VU.vflmul / div) >= 0.125 && ((float)P.VU.vflmul / div) <= 8 ); \
   require_align(insn.rd(), P.VU.vflmul); \
   require_align(insn.rs2(), P.VU.vflmul / div); \
   if ((P.VU.vflmul / div) < 1) { \
@@ -2368,6 +2389,508 @@ for (reg_t i = 0; i < P.VU.vlmax && P.VU.vl != 0; ++i) { \
     default: \
       require(0); \
       break; \
+  }
+
+// The p-extension support is contributed by
+// Programming Langauge Lab, Department of Computer Science, National Tsing-Hua University, Taiwan
+
+#define P_FIELD(R, INDEX, SIZE) \
+  (type_sew_t<SIZE>::type)get_field(R, make_mask64(((INDEX) * SIZE), SIZE))
+
+#define P_UFIELD(R, INDEX, SIZE) \
+  (type_usew_t<SIZE>::type)get_field(R, make_mask64(((INDEX) * SIZE), SIZE))
+
+#define P_B(R, INDEX) P_UFIELD(R, INDEX, 8)
+#define P_H(R, INDEX) P_UFIELD(R, INDEX, 16)
+#define P_W(R, INDEX) P_UFIELD(R, INDEX, 32)
+#define P_SB(R, INDEX) P_FIELD(R, INDEX, 8)
+#define P_SH(R, INDEX) P_FIELD(R, INDEX, 16)
+#define P_SW(R, INDEX) P_FIELD(R, INDEX, 32)
+
+#define READ_REG_PAIR(reg) \
+  MMU.is_target_big_endian() \
+  ? ((zext32(READ_REG(reg)) << 32) + zext32(READ_REG(reg + 1))) \
+  : ((zext32(READ_REG(reg + 1)) << 32) + zext32(READ_REG(reg)))
+
+#define RS1_PAIR READ_REG_PAIR(insn.rs1())
+#define RS2_PAIR READ_REG_PAIR(insn.rs2())
+#define RD_PAIR READ_REG_PAIR(insn.rd())
+
+#define WRITE_PD() \
+  rd_tmp = set_field(rd_tmp, make_mask64((i * sizeof(pd) * 8), sizeof(pd) * 8), pd);
+
+#define WRITE_RD_PAIR(value) \
+  if (MMU.is_target_big_endian()) { \
+    WRITE_REG(insn.rd() + 1, sext32(value)); \
+    WRITE_REG(insn.rd(), ((sreg_t)value) >> 32); \
+  } else { \
+    WRITE_REG(insn.rd(), sext32(value)); \
+    WRITE_REG(insn.rd() + 1, ((sreg_t)value) >> 32); \
+  }
+
+#define P_SET_OV(ov) \
+  P.VU.vxsat |= ov;
+
+#define P_SAT(R, BIT) \
+  if (R > INT##BIT##_MAX) { \
+    R = INT##BIT##_MAX; \
+    P_SET_OV(1); \
+  } else if (R < INT##BIT##_MIN) { \
+    R = INT##BIT##_MIN; \
+    P_SET_OV(1); \
+  }
+
+#define P_SATU(R, BIT) \
+  if (R > UINT##BIT##_MAX) { \
+    R = UINT##BIT##_MAX; \
+    P_SET_OV(1); \
+  } else if (R < 0) { \
+    P_SET_OV(1); \
+    R = 0; \
+  }
+
+#define P_LOOP_BASE(BIT) \
+  require_extension('P'); \
+  require(BIT == e8 || BIT == e16 || BIT == e32); \
+  reg_t rd_tmp = RD; \
+  reg_t rs1 = RS1; \
+  reg_t rs2 = RS2; \
+  sreg_t len = xlen / BIT; \
+  for (sreg_t i = len - 1; i >= 0; --i) {
+
+#define P_ONE_LOOP_BASE(BIT) \
+  require_extension('P'); \
+  require(BIT == e8 || BIT == e16 || BIT == e32); \
+  reg_t rd_tmp = RD; \
+  reg_t rs1 = RS1; \
+  sreg_t len = xlen / BIT; \
+  for (sreg_t i = len - 1; i >= 0; --i) {
+
+#define P_I_LOOP_BASE(BIT, IMMBIT) \
+  require_extension('P'); \
+  require(BIT == e8 || BIT == e16 || BIT == e32); \
+  reg_t rd_tmp = RD; \
+  reg_t rs1 = RS1; \
+  type_usew_t<BIT>::type imm##IMMBIT##u = insn.p_imm##IMMBIT(); \
+  sreg_t len = xlen / BIT; \
+  for (sreg_t i = len - 1; i >= 0; --i) {
+
+#define P_X_LOOP_BASE(BIT, LOWBIT) \
+  require_extension('P'); \
+  require(BIT == e8 || BIT == e16 || BIT == e32); \
+  reg_t rd_tmp = RD; \
+  reg_t rs1 = RS1; \
+  type_usew_t<BIT>::type sa = RS2 & ((uint64_t(1) << LOWBIT) - 1); \
+  type_sew_t<BIT>::type ssa = int64_t(RS2) << (64 - LOWBIT) >> (64 - LOWBIT); \
+  sreg_t len = xlen / BIT; \
+  for (sreg_t i = len - 1; i >= 0; --i) {
+
+#define P_MUL_LOOP_BASE(BIT) \
+  require_extension('P'); \
+  require(BIT == e8 || BIT == e16 || BIT == e32); \
+  reg_t rd_tmp = RD; \
+  reg_t rs1 = RS1; \
+  reg_t rs2 = RS2; \
+  sreg_t len = 32 / BIT; \
+  for (sreg_t i = len - 1; i >= 0; --i) {
+
+#define P_REDUCTION_LOOP_BASE(BIT, BIT_INNER, USE_RD) \
+  require_extension('P'); \
+  require(BIT == e16 || BIT == e32 || BIT == e64); \
+  reg_t rd_tmp = USE_RD ? zext_xlen(RD) : 0; \
+  reg_t rs1 = zext_xlen(RS1); \
+  reg_t rs2 = zext_xlen(RS2); \
+  sreg_t len = 64 / BIT; \
+  sreg_t len_inner = BIT / BIT_INNER; \
+  for (sreg_t i = len - 1; i >= 0; --i) { \
+    sreg_t pd_res = P_FIELD(rd_tmp, i, BIT); \
+    for (sreg_t j = i * len_inner; j < (i + 1) * len_inner; ++j) {
+
+#define P_REDUCTION_ULOOP_BASE(BIT, BIT_INNER, USE_RD) \
+  require_extension('P'); \
+  require(BIT == e16 || BIT == e32 || BIT == e64); \
+  reg_t rd_tmp = USE_RD ? zext_xlen(RD) : 0; \
+  reg_t rs1 = zext_xlen(RS1); \
+  reg_t rs2 = zext_xlen(RS2); \
+  sreg_t len = 64 / BIT; \
+  sreg_t len_inner = BIT / BIT_INNER; \
+  for (sreg_t i = len - 1; i >=0; --i) { \
+    reg_t pd_res = P_UFIELD(rd_tmp, i, BIT); \
+    for (sreg_t j = i * len_inner; j < (i + 1) * len_inner; ++j) {
+
+#define P_PARAMS(BIT) \
+  auto pd = P_FIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_FIELD(rs1, i, BIT); \
+  auto ps2 = P_FIELD(rs2, i, BIT);
+
+#define P_UPARAMS(BIT) \
+  auto pd = P_UFIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_UFIELD(rs1, i, BIT); \
+  auto ps2 = P_UFIELD(rs2, i, BIT);
+
+#define P_CORSS_PARAMS(BIT) \
+  auto pd = P_FIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_FIELD(rs1, i, BIT); \
+  auto ps2 = P_FIELD(rs2, (i ^ 1), BIT);
+
+#define P_CORSS_UPARAMS(BIT) \
+  auto pd = P_UFIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_UFIELD(rs1, i, BIT); \
+  auto ps2 = P_UFIELD(rs2, (i ^ 1), BIT);
+
+#define P_ONE_PARAMS(BIT) \
+  auto pd = P_FIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_FIELD(rs1, i, BIT);
+
+#define P_ONE_UPARAMS(BIT) \
+  auto pd = P_UFIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_UFIELD(rs1, i, BIT);
+
+#define P_ONE_SUPARAMS(BIT) \
+  auto pd = P_UFIELD(rd_tmp, i, BIT); \
+  auto ps1 = P_FIELD(rs1, i, BIT);
+
+#define P_MUL_PARAMS(BIT) \
+  auto pd = P_FIELD(rd_tmp, i, BIT * 2); \
+  auto ps1 = P_FIELD(rs1, i, BIT); \
+  auto ps2 = P_FIELD(rs2, i, BIT);
+
+#define P_MUL_UPARAMS(BIT) \
+  auto pd = P_UFIELD(rd_tmp, i, BIT * 2); \
+  auto ps1 = P_UFIELD(rs1, i, BIT); \
+  auto ps2 = P_UFIELD(rs2, i, BIT);
+
+#define P_MUL_CROSS_PARAMS(BIT) \
+  auto pd = P_FIELD(rd_tmp, i, BIT * 2); \
+  auto ps1 = P_FIELD(rs1, i, BIT); \
+  auto ps2 = P_FIELD(rs2, (i ^ 1), BIT);
+
+#define P_MUL_CROSS_UPARAMS(BIT) \
+  auto pd = P_UFIELD(rd_tmp, i, BIT*2); \
+  auto ps1 = P_UFIELD(rs1, i, BIT); \
+  auto ps2 = P_UFIELD(rs2, (i ^ 1), BIT);
+
+#define P_REDUCTION_PARAMS(BIT_INNER) \
+  auto ps1 = P_FIELD(rs1, j, BIT_INNER); \
+  auto ps2 = P_FIELD(rs2, j, BIT_INNER);
+
+#define P_REDUCTION_UPARAMS(BIT_INNER) \
+  auto ps1 = P_UFIELD(rs1, j, BIT_INNER); \
+  auto ps2 = P_UFIELD(rs2, j, BIT_INNER);
+
+#define P_REDUCTION_SUPARAMS(BIT_INNER) \
+  auto ps1 = P_FIELD(rs1, j, BIT_INNER); \
+  auto ps2 = P_UFIELD(rs2, j, BIT_INNER);
+
+#define P_REDUCTION_CROSS_PARAMS(BIT_INNER) \
+  auto ps1 = P_FIELD(rs1, j, BIT_INNER); \
+  auto ps2 = P_FIELD(rs2, (j ^ 1), BIT_INNER);
+
+#define P_LOOP_BODY(BIT, BODY) { \
+  P_PARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_ULOOP_BODY(BIT, BODY) { \
+  P_UPARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_ONE_LOOP_BODY(BIT, BODY) { \
+  P_ONE_PARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_CROSS_LOOP_BODY(BIT, BODY) { \
+  P_CORSS_PARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_CROSS_ULOOP_BODY(BIT, BODY) { \
+  P_CORSS_UPARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_ONE_ULOOP_BODY(BIT, BODY) { \
+  P_ONE_UPARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_MUL_LOOP_BODY(BIT, BODY) { \
+  P_MUL_PARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_MUL_ULOOP_BODY(BIT, BODY) { \
+  P_MUL_UPARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_MUL_CROSS_LOOP_BODY(BIT, BODY) { \
+  P_MUL_CROSS_PARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_MUL_CROSS_ULOOP_BODY(BIT, BODY) { \
+  P_MUL_CROSS_UPARAMS(BIT) \
+  BODY \
+  WRITE_PD(); \
+}
+
+#define P_LOOP(BIT, BODY) \
+  P_LOOP_BASE(BIT) \
+  P_LOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_ONE_LOOP(BIT, BODY) \
+  P_ONE_LOOP_BASE(BIT) \
+  P_ONE_LOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_ULOOP(BIT, BODY) \
+  P_LOOP_BASE(BIT) \
+  P_ULOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_CROSS_LOOP(BIT, BODY1, BODY2) \
+  P_LOOP_BASE(BIT) \
+  P_CROSS_LOOP_BODY(BIT, BODY1) \
+  --i; \
+  if (sizeof(#BODY2) == 1) { \
+    P_CROSS_LOOP_BODY(BIT, BODY1) \
+  } \
+  else { \
+    P_CROSS_LOOP_BODY(BIT, BODY2) \
+  } \
+  P_LOOP_END()
+
+#define P_CROSS_ULOOP(BIT, BODY1, BODY2) \
+  P_LOOP_BASE(BIT) \
+  P_CROSS_ULOOP_BODY(BIT, BODY1) \
+  --i; \
+  P_CROSS_ULOOP_BODY(BIT, BODY2) \
+  P_LOOP_END()
+
+#define P_STRAIGHT_LOOP(BIT, BODY1, BODY2) \
+  P_LOOP_BASE(BIT) \
+  P_LOOP_BODY(BIT, BODY1) \
+  --i; \
+  P_LOOP_BODY(BIT, BODY2) \
+  P_LOOP_END()
+
+#define P_STRAIGHT_ULOOP(BIT, BODY1, BODY2) \
+  P_LOOP_BASE(BIT) \
+  P_ULOOP_BODY(BIT, BODY1) \
+  --i; \
+  P_ULOOP_BODY(BIT, BODY2) \
+  P_LOOP_END()
+
+#define P_X_LOOP(BIT, RS2_LOW_BIT, BODY) \
+  P_X_LOOP_BASE(BIT, RS2_LOW_BIT) \
+  P_ONE_LOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_X_ULOOP(BIT, RS2_LOW_BIT, BODY) \
+  P_X_LOOP_BASE(BIT, RS2_LOW_BIT) \
+  P_ONE_ULOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_I_LOOP(BIT, IMMBIT, BODY) \
+  P_I_LOOP_BASE(BIT, IMMBIT) \
+  P_ONE_LOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_I_ULOOP(BIT, IMMBIT, BODY) \
+  P_I_LOOP_BASE(BIT, IMMBIT) \
+  P_ONE_ULOOP_BODY(BIT, BODY) \
+  P_LOOP_END()
+
+#define P_MUL_LOOP(BIT, BODY) \
+  P_MUL_LOOP_BASE(BIT) \
+  P_MUL_LOOP_BODY(BIT, BODY) \
+  P_PAIR_LOOP_END()
+
+#define P_MUL_ULOOP(BIT, BODY) \
+  P_MUL_LOOP_BASE(BIT) \
+  P_MUL_ULOOP_BODY(BIT, BODY) \
+  P_PAIR_LOOP_END()
+
+#define P_MUL_CROSS_LOOP(BIT, BODY) \
+  P_MUL_LOOP_BASE(BIT) \
+  P_MUL_CROSS_LOOP_BODY(BIT, BODY) \
+  P_PAIR_LOOP_END()
+
+#define P_MUL_CROSS_ULOOP(BIT, BODY) \
+  P_MUL_LOOP_BASE(BIT) \
+  P_MUL_CROSS_ULOOP_BODY(BIT, BODY) \
+  P_PAIR_LOOP_END()
+
+#define P_REDUCTION_LOOP(BIT, BIT_INNER, USE_RD, IS_SAT, BODY) \
+  P_REDUCTION_LOOP_BASE(BIT, BIT_INNER, USE_RD) \
+  P_REDUCTION_PARAMS(BIT_INNER) \
+  BODY \
+  P_REDUCTION_LOOP_END(BIT, IS_SAT)
+
+#define P_REDUCTION_ULOOP(BIT, BIT_INNER, USE_RD, IS_SAT, BODY) \
+  P_REDUCTION_ULOOP_BASE(BIT, BIT_INNER, USE_RD) \
+  P_REDUCTION_UPARAMS(BIT_INNER) \
+  BODY \
+  P_REDUCTION_ULOOP_END(BIT, IS_SAT)
+
+#define P_REDUCTION_SULOOP(BIT, BIT_INNER, USE_RD, IS_SAT, BODY) \
+  P_REDUCTION_LOOP_BASE(BIT, BIT_INNER, USE_RD) \
+  P_REDUCTION_SUPARAMS(BIT_INNER) \
+  BODY \
+  P_REDUCTION_LOOP_END(BIT, IS_SAT)
+
+#define P_REDUCTION_CROSS_LOOP(BIT, BIT_INNER, USE_RD, IS_SAT, BODY) \
+  P_REDUCTION_LOOP_BASE(BIT, BIT_INNER, USE_RD) \
+  P_REDUCTION_CROSS_PARAMS(BIT_INNER) \
+  BODY \
+  P_REDUCTION_LOOP_END(BIT, IS_SAT)
+
+#define P_LOOP_END() \
+  } \
+  WRITE_RD(sext_xlen(rd_tmp));
+
+#define P_PAIR_LOOP_END() \
+  } \
+  if (xlen == 32) { \
+    WRITE_RD_PAIR(rd_tmp); \
+  } \
+  else { \
+    WRITE_RD(sext_xlen(rd_tmp)); \
+  }
+
+#define P_REDUCTION_LOOP_END(BIT, IS_SAT) \
+    } \
+    if (IS_SAT) { \
+      P_SAT(pd_res, BIT); \
+    } \
+    type_usew_t<BIT>::type pd = pd_res; \
+    WRITE_PD(); \
+  } \
+  WRITE_RD(sext_xlen(rd_tmp));
+
+#define P_REDUCTION_ULOOP_END(BIT, IS_SAT) \
+    } \
+    if (IS_SAT) { \
+      P_SATU(pd_res, BIT); \
+    } \
+    type_usew_t<BIT>::type pd = pd_res; \
+    WRITE_PD(); \
+  } \
+  WRITE_RD(sext_xlen(rd_tmp));
+
+#define P_SUNPKD8(X, Y) \
+  require_extension('P'); \
+  reg_t rd_tmp = 0; \
+  int16_t pd[4] = { \
+    P_SB(RS1, Y), \
+    P_SB(RS1, X), \
+    P_SB(RS1, Y + 4), \
+    P_SB(RS1, X + 4), \
+  }; \
+  if (xlen == 64) { \
+    memcpy(&rd_tmp, pd, 8); \
+  } else { \
+    memcpy(&rd_tmp, pd, 4); \
+  } \
+  WRITE_RD(sext_xlen(rd_tmp));
+
+#define P_ZUNPKD8(X, Y) \
+  require_extension('P'); \
+  reg_t rd_tmp = 0; \
+  uint16_t pd[4] = { \
+    P_B(RS1, Y), \
+    P_B(RS1, X), \
+    P_B(RS1, Y + 4), \
+    P_B(RS1, X + 4), \
+  }; \
+  if (xlen == 64) { \
+    memcpy(&rd_tmp, pd, 8); \
+  } else { \
+    memcpy(&rd_tmp, pd, 4); \
+  } \
+  WRITE_RD(sext_xlen(rd_tmp));
+
+#define P_PK(BIT, X, Y) \
+  require_extension('P'); \
+  require(BIT == e16 || BIT == e32); \
+  reg_t rd_tmp = 0, rs1 = RS1, rs2 = RS2; \
+  for (sreg_t i = 0; i < xlen / BIT / 2; i++) { \
+    rd_tmp = set_field(rd_tmp, make_mask64(i * 2 * BIT, BIT), \
+      P_UFIELD(RS2, i * 2 + Y, BIT)); \
+    rd_tmp = set_field(rd_tmp, make_mask64((i * 2 + 1) * BIT, BIT), \
+      P_UFIELD(RS1, i * 2 + X, BIT)); \
+  } \
+  WRITE_RD(sext_xlen(rd_tmp));
+
+#define P_64_PROFILE_BASE() \
+  require_extension('P'); \
+  sreg_t rd, rs1, rs2;
+
+#define P_64_UPROFILE_BASE() \
+  require_extension('P'); \
+  reg_t rd, rs1, rs2;
+
+#define P_64_PROFILE_PARAM(USE_RD, INPUT_PAIR) \
+  if (xlen == 32) { \
+    rs1 = INPUT_PAIR ? RS1_PAIR : RS1; \
+    rs2 = INPUT_PAIR ? RS2_PAIR : RS2; \
+    rd = USE_RD ? RD_PAIR : 0; \
+  } else { \
+    rs1 = RS1; \
+    rs2 = RS2; \
+    rd = USE_RD ? RD : 0; \
+  }
+
+#define P_64_PROFILE(BODY) \
+  P_64_PROFILE_BASE() \
+  P_64_PROFILE_PARAM(false, true) \
+  BODY \
+  P_64_PROFILE_END() \
+
+#define P_64_UPROFILE(BODY) \
+  P_64_UPROFILE_BASE() \
+  P_64_PROFILE_PARAM(false, true) \
+  BODY \
+  P_64_PROFILE_END() \
+
+#define P_64_PROFILE_REDUCTION(BIT, BODY) \
+  P_64_PROFILE_BASE() \
+  P_64_PROFILE_PARAM(true, false) \
+  for (sreg_t i = 0; i < xlen / BIT; i++) { \
+    sreg_t ps1 = P_FIELD(rs1, i, BIT); \
+    sreg_t ps2 = P_FIELD(rs2, i, BIT); \
+    BODY \
+  } \
+  P_64_PROFILE_END() \
+
+#define P_64_UPROFILE_REDUCTION(BIT, BODY) \
+  P_64_UPROFILE_BASE() \
+  P_64_PROFILE_PARAM(true, false) \
+  for (sreg_t i = 0; i < xlen / BIT; i++) { \
+    reg_t ps1 = P_UFIELD(rs1, i, BIT); \
+    reg_t ps2 = P_UFIELD(rs2, i, BIT); \
+    BODY \
+  } \
+  P_64_PROFILE_END() \
+
+#define P_64_PROFILE_END() \
+  if (xlen == 32) { \
+    WRITE_RD_PAIR(rd); \
+  } else { \
+    WRITE_RD(sext_xlen(rd)); \
   }
 
 #define DEBUG_START             0x0

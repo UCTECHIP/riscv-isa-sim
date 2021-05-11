@@ -4,14 +4,16 @@
 
 #include "decode.h"
 #include "config.h"
-#include "devices.h"
 #include "trap.h"
+#include "abstract_device.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <map>
 #include <cassert>
 #include "debug_rom_defines.h"
+#include "entropy_source.h"
+
 
 class processor_t;
 class mmu_t;
@@ -242,8 +244,15 @@ typedef enum {
 typedef enum {
   // 65('A') ~ 90('Z') is reserved for standard isa in misa
   EXT_ZFH   = 0,
-  EXT_ZVEDIV,
 } isa_extension_t;
+
+typedef enum {
+  IMPL_MMU_SV32,
+  IMPL_MMU_SV39,
+  IMPL_MMU_SV48,
+  IMPL_MMU_SBARE,
+  IMPL_MMU,
+} impl_extension_t;
 
 // Count number of contiguous 1 bits starting from the LSB.
 static int cto(reg_t val)
@@ -285,12 +294,17 @@ public:
            supports_extension('D') ? 64 :
            supports_extension('F') ? 32 : 0;
   }
-  extension_t* get_extension() { return ext; }
+  extension_t* get_extension();
+  extension_t* get_extension(const char* name);
   bool supports_extension(unsigned char ext) {
     if (ext >= 'A' && ext <= 'Z')
       return ((state.misa >> (ext - 'A')) & 1);
     else
       return extension_table[ext];
+  }
+  void set_impl(uint8_t impl, bool val) { impl_table[impl] = val; }
+  bool supports_impl(uint8_t impl) const {
+    return impl_table[impl];
   }
   reg_t pc_alignment_mask() {
     return ~(reg_t)(supports_extension('C') ? 0 : 2);
@@ -409,13 +423,14 @@ public:
 
   void set_pmp_num(reg_t pmp_num);
   void set_pmp_granularity(reg_t pmp_granularity);
+  void set_mmu_capability(int cap);
 
   const char* get_symbol(uint64_t addr);
 
 private:
   simif_t* sim;
   mmu_t* mmu; // main memory is always accessed via the mmu
-  extension_t* ext;
+  std::unordered_map<std::string, extension_t*> custom_extensions;
   disassembler_t* disassembler;
   state_t state;
   uint32_t id;
@@ -428,7 +443,9 @@ private:
   FILE *log_file;
   bool halt_on_reset;
   std::vector<bool> extension_table;
+  std::vector<bool> impl_table;
   
+  entropy_source es; // Crypto ISE Entropy source.
 
   std::vector<insn_desc_t> instructions;
   std::map<reg_t,uint64_t> pc_histogram;
@@ -456,6 +473,7 @@ private:
   void build_opcode_map();
   void register_base_instructions();
   insn_func_t decode_insn(insn_t insn);
+  reg_t cal_satp(reg_t val) const;
 
   // Track repeated executions for processor_t::disasm()
   uint64_t last_pc, last_bits, executions;
@@ -472,7 +490,7 @@ public:
       reg_t vlmax;
       reg_t vstart, vxrm, vxsat, vl, vtype, vlenb;
       reg_t vma, vta;
-      reg_t vediv, vsew;
+      reg_t vsew;
       float vflmul;
       reg_t ELEN, VLEN;
       bool vill;
@@ -489,7 +507,7 @@ public:
 #ifdef WORDS_BIGENDIAN
           // "V" spec 0.7.1 requires lower indices to map to lower significant
           // bits when changing SEW, thus we need to index from the end on BE.
-  	  n ^= elts_per_reg - 1;
+          n ^= elts_per_reg - 1;
 #endif
           reg_referenced[vReg] = 1;
 
@@ -530,9 +548,9 @@ public:
 
 reg_t illegal_instruction(processor_t* p, insn_t insn, reg_t pc);
 
-#define REGISTER_INSN(proc, name, match, mask) \
+#define REGISTER_INSN(proc, name, match, mask, archen) \
   extern reg_t rv32_##name(processor_t*, insn_t, reg_t); \
   extern reg_t rv64_##name(processor_t*, insn_t, reg_t); \
-  proc->register_insn((insn_desc_t){match, mask, rv32_##name, rv64_##name});
+  proc->register_insn((insn_desc_t){match, mask, rv32_##name, rv64_##name,archen});
 
 #endif

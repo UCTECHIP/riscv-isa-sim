@@ -76,7 +76,7 @@ static void commit_log_print_insn(processor_t *p, reg_t pc, insn_t insn)
   int flen = p->get_state()->last_inst_flen;
 
   // print core id on all lines so it is easy to grep
-  fprintf(log_file, "core%4" PRId64 ": ", p->get_id());
+  fprintf(log_file, "core%4" PRId32 ": ", p->get_id());
 
   fprintf(log_file, "%1d ", priv);
   commit_log_print_value(log_file, xlen, pc);
@@ -188,6 +188,9 @@ static reg_t execute_insn(processor_t* p, reg_t pc, insn_fetch_t fetch)
 
      }
 #ifdef RISCV_ENABLE_COMMITLOG
+  } catch (wait_for_interrupt_t &t) {
+      commit_log_print_insn(p, pc, fetch.insn);
+      throw;
   } catch(mem_trap_t& t) {
       //handle segfault in midlle of vector load/store
       if (p->get_log_commits_enabled()) {
@@ -371,7 +374,7 @@ void processor_t::step(size_t n)
       // In the debug ROM this prevents us from wasting time looping, but also
       // allows us to switch to other threads only once per idle loop in case
       // there is activity.
-      n = instret;
+      n = ++instret;
     }
 
     state.minstret += instret;

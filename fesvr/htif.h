@@ -6,9 +6,11 @@
 #include "memif.h"
 #include "syscall.h"
 #include "device.h"
+#include "byteorder.h"
 #include <string.h>
 #include <map>
 #include <vector>
+#include <assert.h>
 
 class htif_t : public chunked_memif_t
 {
@@ -26,6 +28,30 @@ class htif_t : public chunked_memif_t
   int exit_code();
 
   virtual memif_t& memif() { return mem; }
+
+  template<typename T> inline T from_target(target_endian<T> n) const
+  {
+#ifdef RISCV_ENABLE_DUAL_ENDIAN
+    memif_endianness_t endianness = get_target_endianness();
+    assert(endianness == memif_endianness_little || endianness == memif_endianness_big);
+
+    return endianness == memif_endianness_big? n.from_be() : n.from_le();
+#else
+    return n.from_le();
+#endif
+  }
+
+  template<typename T> inline target_endian<T> to_target(T n) const
+  {
+#ifdef RISCV_ENABLE_DUAL_ENDIAN
+    memif_endianness_t endianness = get_target_endianness();
+    assert(endianness == memif_endianness_little || endianness == memif_endianness_big);
+
+    return endianness == memif_endianness_big? target_endian<T>::to_be(n) : target_endian<T>::to_le(n);
+#else
+    return target_endian<T>::to_le(n);
+#endif
+  }
 
  protected:
   virtual void reset() = 0;
@@ -63,6 +89,7 @@ class htif_t : public chunked_memif_t
   std::vector<std::string> hargs;
   std::vector<std::string> targs;
   std::string sig_file;
+  unsigned int line_size;
   addr_t sig_addr; // torture
   addr_t sig_len; // torture
   addr_t tohost_addr;
@@ -100,6 +127,8 @@ class htif_t : public chunked_memif_t
        +rfb=DISPLAY          to be accessible on 5900 + DISPLAY (default = 0)\n\
       --signature=FILE     Write torture test signature to FILE\n\
        +signature=FILE\n\
+      --signature-granularity=VAL           Size of each line in signature.\n\
+       +signature-granularity=VAL\n\
       --chroot=PATH        Use PATH as location of syscall-servicing binaries\n\
        +chroot=PATH\n\
       --payload=PATH       Load PATH memory as an additional ELF payload\n\
@@ -121,6 +150,7 @@ TARGET (RISC-V BINARY) OPTIONS\n\
 {"signature", required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 2 },     \
 {"chroot",    required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 3 },     \
 {"payload",   required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 4 },     \
+{"signature-granularity",    optional_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 5 },     \
 {0, 0, 0, 0}
 
 #endif // __HTIF_H
