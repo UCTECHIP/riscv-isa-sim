@@ -269,6 +269,9 @@ void processor_t::parse_isa_string(const char* str)
       auto ext_str = std::string(ext, end - ext);
       if (ext_str == "zfh") {
         extension_table[EXT_ZFH] = true;
+      } else if (ext_str == "zvamo") {
+      } else if (ext_str == "zvlsseg") {
+      } else if (ext_str == "zvqmac") {
       } else {
         sprintf(error_msg, "unsupported extension '%s'", ext_str.c_str());
         bad_isa_string(str, error_msg);
@@ -387,8 +390,8 @@ reg_t processor_t::vectorUnit_t::set_vl(int rd, int rs1, reg_t reqVL, reg_t newT
   int new_vlmul = 0;
   if (vtype != newType){
     vtype = newType;
-    vsew = 1 << (extract64(newType, 3, 3) + 3);
-    new_vlmul = int8_t(extract64(newType, 0, 3) << 5) >> 5;
+    vsew = 1 << (extract64(newType, 2, 3) + 3);
+    new_vlmul = int8_t((extract64(newType, 0, 2) | (extract64(newType, 5, 1) << 2)) << 5) >> 5;
     vflmul = new_vlmul >= 0 ? 1 << new_vlmul : 1.0 / (1 << -new_vlmul);
     vlmax = (VLEN/vsew) * vflmul;
     vta = extract64(newType, 6, 1);
