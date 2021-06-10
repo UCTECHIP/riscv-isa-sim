@@ -208,6 +208,14 @@ static reg_t execute_insn(processor_t* p, reg_t pc, insn_fetch_t fetch)
   }
   p->update_histogram(pc);
 
+  //Performance Monitor
+  p->perf_inst_type_statistic();
+  p->perf_data_hazard_raw();
+  p->perf_data_hazard_war();
+  p->perf_data_hazard_waw();
+  p->perf_struct_hazard();
+  p->perf_inst_pipe();
+
   return npc;
 }
 
