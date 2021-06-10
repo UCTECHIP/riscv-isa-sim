@@ -10,6 +10,7 @@ riscv_install_prog_srcs = \
 riscv_CFLAGS = -fPIC
 
 riscv_hdrs = \
+        performance.h \
 	abstract_device.h \
 	common.h \
 	decode.h \
@@ -40,6 +41,7 @@ riscv_precompiled_hdrs = \
 	insn_template.h \
 
 riscv_srcs = \
+        performance.cc \
 	processor.cc \
 	execute.cc \
 	dts.cc \

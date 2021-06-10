@@ -64,7 +64,8 @@ processor_t::~processor_t()
       fprintf(stderr, "%0" PRIx64 " %" PRIu64 "\n", it.first, it.second);
   }
 #endif
-
+  perf_print_report(this->id);
+  fclose(this->perf_file);
   delete mmu;
   delete disassembler;
 }
@@ -373,6 +374,7 @@ void state_t::reset(reg_t max_isa)
   last_inst_xlen = 0;
   last_inst_flen = 0;
 #endif
+
 }
 
 void processor_t::vectorUnit_t::reset(){
@@ -481,6 +483,8 @@ void processor_t::reset()
 
   if (sim)
     sim->proc_reset(id);
+
+  this->perf_reset();
 }
 
 extension_t* processor_t::get_extension()

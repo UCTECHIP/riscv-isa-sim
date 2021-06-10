@@ -13,7 +13,7 @@
 #include <cassert>
 #include "debug_rom_defines.h"
 #include "entropy_source.h"
-
+#include "performance.h"
 
 class processor_t;
 class mmu_t;
@@ -544,6 +544,38 @@ public:
   };
 
   vectorUnit_t VU;
+
+  // Performance Monitor
+  FILE *perf_file;
+  bool perf_enable;
+  perf_pipeline_t perf_pipeline[PERF_PIPE_STAGE];
+  uint64_t perf_inst_type_int[PERF_NUM_INST_TYPE_INT];
+  uint64_t perf_inst_type_float[PERF_NUM_INST_TYPE_FLOAT];
+  uint64_t perf_inst_type_vector[PERF_NUM_INST_TYPE_VECTOR];
+  uint64_t perf_waw [PERF_PIPE_STAGE];
+  uint64_t perf_war [PERF_PIPE_STAGE];
+  uint64_t perf_raw_x_x[PERF_PIPE_STAGE][PERF_NUM_INST_TYPE_INT][PERF_NUM_INST_TYPE_INT];
+  uint64_t perf_raw_f_f[PERF_PIPE_STAGE][PERF_NUM_INST_TYPE_FLOAT][PERF_NUM_INST_TYPE_FLOAT];
+  uint64_t perf_raw_v_v[PERF_PIPE_STAGE][PERF_NUM_INST_TYPE_VECTOR][PERF_NUM_INST_TYPE_VECTOR];
+  uint64_t perf_raw_a_a[PERF_PIPE_STAGE][PERF_NUM_INST_TYPE][PERF_NUM_INST_TYPE];
+  uint64_t perf_struct_int;
+  uint64_t perf_struct_float;
+  uint64_t perf_struct_vx;
+  uint64_t perf_struct_vf;
+  uint64_t perf_div_model_int;
+  uint64_t perf_div_model_float;
+  uint64_t perf_div_model_vx;
+  uint64_t perf_div_model_vf;
+  void perf_reset();
+  void perf_inst_pipe();
+  void perf_inst_type_statistic();
+  void perf_data_hazard_raw();
+  void perf_data_hazard_waw();
+  void perf_data_hazard_war();
+  void perf_struct_hazard();
+
+  void perf_print_report(size_t id);
+
 };
 
 reg_t illegal_instruction(processor_t* p, insn_t insn, reg_t pc);
